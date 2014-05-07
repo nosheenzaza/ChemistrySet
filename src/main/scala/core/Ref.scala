@@ -5,10 +5,29 @@ package chemistry
 import scala.annotation.tailrec
 import java.util.concurrent.atomic._
 
+/**
+ * This is basically a wrapper of AtomicReference, of the most common policy
+ * of what to do when a CAS fails. 
+ */
 final class Ref[A <: AnyRef](init: A) {
+  /**
+   * Pointer to atomic data, ensures atomicity if usage 
+   * TODO look at the type specification to see which guarantees we have
+   */
   private[chemistry] val data = new AtomicReference(init)
+  
+  /**
+   * This is to doing something when a CAS to the atomic reference fails. That 
+   * is, if there is a race to update the reference, we might ask another thread
+   * to help out acheiving the operaton, in this case, no retry is needed.
+   * 
+   * TODO I cannot see what offering a read is baked in by default.
+   */
   private[chemistry] val offers = new CircularPool[Offer[_]]
 
+  /**
+   * TODO learn what this does.
+   */
   private[chemistry] def afterCAS {
     @tailrec def wakeFrom(n: offers.Node): Unit = if (n != null) {
       n.data.abortAndWake
@@ -17,6 +36,9 @@ final class Ref[A <: AnyRef](init: A) {
     wakeFrom(offers.cursor)
   }  
 
+  /**
+   * 
+   */
   private final case class Read[B](k: Reagent[A,B]) extends Reagent[Unit, B] {
     def tryReact(u: Unit, rx: Reaction, offer: Offer[B]): Any = {
       if (offer != null) offers.put(offer)
@@ -53,6 +75,10 @@ final class Ref[A <: AnyRef](init: A) {
   }
   @inline def cas(ov:A,nv:A): Reagent[Unit,Unit] = CAS(ov, nv, Commit[Unit]()) 
 
+  /**
+   * So this seems to be a reagent that takes care of updating the value of 
+   * a ref. Why it is a reagent and takes another reagent, that I don't know.
+   */
   abstract class InnerUpd[B,C,D] private[chemistry] (k: Reagent[C,D])
 	   extends Reagent[B, D] {
     def tryReact(b: B, rx: Reaction, offer: Offer[D]): Any = {
@@ -89,12 +115,27 @@ final class Ref[A <: AnyRef](init: A) {
     def retValue(a: A, b: B): C
     def retryValue(cur: A, lastAttempt: A, b: B): A = newValue(cur, b)
   }
-  abstract class Upd[B,C] extends InnerUpd[B,C,C](Commit[C]())
+  abstract class Upd[B,C] extends InnerUpd[B,C,C](Commit[C]()) // commit is a reagent itself, what it exactly does I don't know.
 
+  /**
+   * For the case of a Treiber Stack of Ints: return an InnerUpd reagent 
+   * parameterized [Int, Unit, Unit] with a Commit reagent as a parameter
+   * 
+   * The mentioned type parameters are as follows:
+   * A: the type of the ref Content I believe 
+   * B: Input type to the update reagent
+   * C return type of the update reagent
+   * 
+   * So for Triber stack as an instance, with function push, A is List[B], 
+   * B is the parameter of List, and C is Unit.  
+   */
   @inline def upd[B,C](f: (A,B) => (A,C)): Reagent[B, C] = 
+    /* Upd is a subtype of reagent, here we provide implementations for the 
+     * abstract methods 
+     * B is the input type, and C is the return type */
     new Upd[B,C] {
-      @inline def newValue(a: A, b: B): A = f(a,b)._1
-      @inline def retValue(a: A, b: B): C = f(a,b)._2
+      @inline def newValue(a: A, b: B): A = f(a,b)._1 
+      @inline def retValue(a: A, b: B): C = f(a,b)._2 
     }
 
   @inline def upd[B](f: PartialFunction[A,(A,B)]): Reagent[Unit, B] =

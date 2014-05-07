@@ -6,6 +6,9 @@ import scala.annotation.tailrec
 import java.util.concurrent.locks._
 import chemistry.Util.Implicits._
 
+/**
+ * Commands to be executed when a CAS fails. Either block or retry.
+ */
 private[chemistry] sealed abstract class BacktrackCommand {
   // what to do when the backtracking command runs out of choices
   // (i.e., hits bottom)
@@ -23,6 +26,27 @@ private[chemistry] case object Retry extends BacktrackCommand {
   def isBlock: Boolean = false
 }
 
+/**
+ * A reagent is very much like a function, but it has some custom, pre-defined
+ * combinators that occur commonly in concurrent programming.
+ *  
+ * Type parameter 'A' is the input to a reagent, it is like a function parameter, to pass multiple
+ * parameters, pass a tuple. TODO this might lead to problems with type checking
+ * and the variance of paramers, reseach this!
+ * 
+ * Type parameter 'B' is the value returned from the reagent, again like a return
+ * type of a function.
+ * 
+ * A main part of a reagent is a reaction, it is somehow a member of reagent,
+ * but in a functional way, it is passed to a reagent through tryReact, then
+ * the client of the reagent may mutate it! Look at InnerRef for an example.
+ * 
+ * So inside the reaction, we handle the logic of cas'es and offers and actually
+ * executing the functions that do the "real" work. The agents are about 
+ * composing and so.
+ * 
+ * 
+ */
 abstract class Reagent[-A, +B] {
   // returns either a BacktrackCommand or a B
   private[chemistry] def tryReact(a: A, rx: Reaction, offer: Offer[B]): Any
@@ -31,33 +55,54 @@ abstract class Reagent[-A, +B] {
   private[chemistry] def maySync: Boolean
   private[chemistry] def snoop(a: A): Boolean
 
+  /**
+   * TODO this is interesting, keep an eye on that.
+   */
   final def compose[C](next: Reagent[B,C]): Reagent[A,C] = next match {
     case Commit() => this.asInstanceOf[Reagent[A,C]] // B = C
     case _ => composeI(next)
   }
 
+  /**
+   * To call a reagent as a reactant, we use this method, this is a very
+   * important part of this class, library clients interact with reagents using
+   * this method.
+   * 
+   * a is the input to the reagent.
+   */
   final def !(a: A): B = tryReact(a, Reaction.inert, null) match {
+    /**
+     * A reaction either succeeds, returning some value of type B (the return
+     * type of the reagent)
+     * TODO I wonder why ans in the case of successful return has no type.
+     * 
+     * Or it fails, returning a backtrack command, in which case we retry.
+     */
     case (_: BacktrackCommand) => {
+      /* Controls the logic of retrying, mainly, how often to retry */
       val backoff = new Backoff
-      val maySync = this.maySync // cache
-      @tailrec def retryLoop(shouldBlock: Boolean): B = {
-	// to think about: can a single waiter be reused?
-	val wait = maySync || shouldBlock
-	val waiter = if (wait) new Waiter[B](shouldBlock) else null
 
-	tryReact(a, Reaction.inert, waiter) match {
-	  case (bc: BacktrackCommand) if wait => {
-	    bc.bottom(waiter, backoff, snoop(a))
-	    waiter.tryAbort match { // rescind waiter, but check if already
-				    // completed
-	      case Some(ans) => ans.asInstanceOf[B] 
-	      case None      => retryLoop(bc.isBlock)
-	    }
-	  }
-	  case Retry => backoff.once; retryLoop(false)
-	  case Block => retryLoop(true)
-	  case ans => ans.asInstanceOf[B]
-	}
+      val maySync = this.maySync // cache
+
+      @tailrec def retryLoop(shouldBlock: Boolean): B = {
+        // to think about: can a single waiter be reused?
+        val wait = maySync || shouldBlock
+        val waiter = if (wait) new Waiter[B](shouldBlock) else null
+
+        tryReact(a, Reaction.inert, waiter) match {
+          case (bc: BacktrackCommand) if wait => {
+            bc.bottom(waiter, backoff, snoop(a))
+            waiter.tryAbort match { // rescind waiter, but check if already
+              // completed
+              case Some(ans) => ans.asInstanceOf[B]
+              case None => retryLoop(bc.isBlock)
+            }
+          }
+          case Retry =>
+            backoff.once; retryLoop(false)
+          case Block => retryLoop(true)
+          case ans => ans.asInstanceOf[B]
+        }
       }
       backoff.once
       retryLoop(false)
@@ -65,6 +110,9 @@ abstract class Reagent[-A, +B] {
     case ans => ans.asInstanceOf[B]
   }
 
+  /**
+   * TODO read in the paper what this is. I think it will not retry upon failure.
+   */
   @inline final def !?(a:A) : Option[B] = {
     tryReact(a, Reaction.inert, null) match {
       case Retry => None // should we actually retry here?  if we do, more
@@ -139,21 +187,24 @@ object ret {
 //     throw ShouldRetry
 // }
 
-private final case class Commit[A]() extends Reagent[A,A] {
+/**
+ * Commit is a reagent, whose param and return types are the same. 
+ */
+private final case class Commit[A]() extends Reagent[A, A] {
   def tryReact(a: A, rx: Reaction, offer: Offer[A]): Any = {
     offer match {
       case null => if (rx.tryCommit) a else Retry
-//      case (w: Waiter[_]) => if (w.rxWithAbort(rx).tryCommit) a else Retry
+      //      case (w: Waiter[_]) => if (w.rxWithAbort(rx).tryCommit) a else Retry
       case (w: Waiter[_]) => {
-	w.tryAbort match { // rescind waiter, but check if already completed
-	  case Some(ans) => ans
-	  case None      => if (rx.tryCommit) a else Retry
-	}
+        w.tryAbort match { // rescind waiter, but check if already completed
+          case Some(ans) => ans
+          case None => if (rx.tryCommit) a else Retry
+        }
       }
       case (_: Catalyst[_]) => {
-	rx.tryCommit
-	Block
-      }	
+        rx.tryCommit
+        Block
+      }
     }
   }
   def snoop(a: A) = true

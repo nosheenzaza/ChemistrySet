@@ -5,6 +5,14 @@ package chemistry
 
 import scala.collection.immutable.HashSet
 
+/**
+ * In the case of Treiber Stack, the reaction that is basically like 0 for 
+ * integers, almost like an identity reaction, look at the inert val to see
+ * which reaction is used.
+ * 
+ * Notice how the classes are very functional, pay attention to that and you 
+ * will be able to better understand how things work.  
+ */
 private sealed class Reaction private (
   val casList: List[CAS[_]],		// k-cas built up so far
   val pcList: List[Unit => Unit],	// post-commit actions
